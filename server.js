@@ -32,6 +32,7 @@ app.use(express.json());
 const JWT_SECRET = process.env.JWT_SECRET || 'change-this-before-you-deploy';
 const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '').toLowerCase().trim();
 const LEGISCAN_API_KEY = process.env.LEGISCAN_API_KEY || '';
+const COURTLISTENER_API_TOKEN = process.env.COURTLISTENER_API_TOKEN || '';
 const DB_FILE = path.join(__dirname, 'data.json');
 
 if(JWT_SECRET === 'change-this-before-you-deploy'){
@@ -219,6 +220,50 @@ app.get('/api/bills', async (req, res) => {
   }catch(e){
     console.error('LegiScan lookup failed:', e.message);
     res.status(502).json({ error: 'Could not reach LegiScan right now — try again shortly.' });
+  }
+});
+
+/* ---------------- Recent 2A / firearm case-law feed ---------------- */
+// Uses CourtListener (Free Law Project — a nonprofit, genuinely free legal
+// database). Works with no API key at all (their anonymous tier), but if
+// COURTLISTENER_API_TOKEN is set (free — register at courtlistener.com,
+// same idea as the LegiScan key) requests are authenticated for more
+// reliable access. One shared national cache, refreshed once a day —
+// case law moves far slower than legislation, so there's no need to hit
+// this more often or cache it per-state.
+const caseLawCache = { data: null, ts: 0 };
+const CASE_LAW_CACHE_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+app.get('/api/case-law', async (req, res) => {
+  if(caseLawCache.data && (Date.now() - caseLawCache.ts) < CASE_LAW_CACHE_MS){
+    return res.json({ cases: caseLawCache.data, cached: true });
+  }
+
+  try{
+    const url = 'https://www.courtlistener.com/api/rest/v4/search/?q='
+      + encodeURIComponent('"second amendment" OR firearm OR "concealed carry"')
+      + '&type=o&order_by=dateFiled%20desc';
+    const headers = COURTLISTENER_API_TOKEN ? { Authorization: 'Token ' + COURTLISTENER_API_TOKEN } : {};
+    const r = await fetch(url, { headers });
+    const json = await r.json();
+
+    if(!json.results){
+      return res.status(502).json({ error: 'CourtListener did not return results.' });
+    }
+
+    const cases = json.results.slice(0, 8).map(item => ({
+      caseName: item.caseName,
+      court: item.court,
+      dateFiled: item.dateFiled,
+      url: item.absolute_url ? ('https://www.courtlistener.com' + item.absolute_url) : null,
+    }));
+
+    caseLawCache.data = cases;
+    caseLawCache.ts = Date.now();
+    res.json({ cases, cached: false });
+  }catch(e){
+    console.error('CourtListener lookup failed:', e.message);
+    res.status(502).json({ error: 'Could not reach CourtListener right now — try again shortly.' });
   }
 });
 
