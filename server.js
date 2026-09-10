@@ -31,6 +31,7 @@ app.use(express.json());
 
 const JWT_SECRET = process.env.JWT_SECRET || 'change-this-before-you-deploy';
 const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '').toLowerCase().trim();
+const LEGISCAN_API_KEY = process.env.LEGISCAN_API_KEY || '';
 const DB_FILE = path.join(__dirname, 'data.json');
 
 if(JWT_SECRET === 'change-this-before-you-deploy'){
@@ -166,6 +167,59 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, (req, res) => {
       longestStreak: (db.streaks[u.id] || {}).longestStreak || 0,
     })),
   });
+});
+
+/* ---------------- LegiScan bill-tracking feed ---------------- */
+// Free tier: 30,000 queries/month. We cache each state's results for 6 hours
+// so a busy day of app traffic never comes close to burning through that.
+// The API key lives only here on the server — it's never sent to the app.
+const billsCache = {}; // { [stateAbbr]: { data: [...], ts: <ms> } }
+const BILLS_CACHE_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+app.get('/api/bills', async (req, res) => {
+  const state = String(req.query.state || '').toUpperCase().trim();
+  if(!/^[A-Z]{2}$/.test(state)){
+    return res.status(400).json({ error: 'Pass a 2-letter state code, e.g. ?state=MD.' });
+  }
+  if(!LEGISCAN_API_KEY){
+    return res.status(503).json({ error: 'Bill tracking isn\'t configured yet (missing LEGISCAN_API_KEY).' });
+  }
+
+  const cached = billsCache[state];
+  if(cached && (Date.now() - cached.ts) < BILLS_CACHE_MS){
+    return res.json({ state, bills: cached.data, cached: true });
+  }
+
+  try{
+    const url = 'https://api.legiscan.com/?key=' + encodeURIComponent(LEGISCAN_API_KEY)
+      + '&op=getSearch&state=' + encodeURIComponent(state)
+      + '&query=' + encodeURIComponent('firearm');
+    const r = await fetch(url);
+    const json = await r.json();
+
+    if(json.status !== 'OK' || !json.searchresult){
+      return res.status(502).json({ error: 'LegiScan did not return results for that state.' });
+    }
+
+    const bills = Object.values(json.searchresult)
+      .filter(item => item && typeof item === 'object' && item.bill_id)
+      .map(item => ({
+        billNumber: item.bill_number,
+        title: item.title,
+        lastAction: item.last_action,
+        lastActionDate: item.last_action_date,
+        url: item.url,
+        relevance: item.relevance,
+      }))
+      .sort((a, b) => (b.lastActionDate || '').localeCompare(a.lastActionDate || ''))
+      .slice(0, 8);
+
+    billsCache[state] = { data: bills, ts: Date.now() };
+    res.json({ state, bills, cached: false });
+  }catch(e){
+    console.error('LegiScan lookup failed:', e.message);
+    res.status(502).json({ error: 'Could not reach LegiScan right now — try again shortly.' });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
