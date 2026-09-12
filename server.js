@@ -41,14 +41,33 @@ if(JWT_SECRET === 'change-this-before-you-deploy'){
 
 function loadDB(){
   let db;
-  if(!fs.existsSync(DB_FILE)) db = { users: [], streaks: {}, stories: [], questions: [] };
+  const blank = { users: [], streaks: {}, stories: [], questions: [], visits: { total: 0, uniqueIds: [] } };
+  if(!fs.existsSync(DB_FILE)) db = blank;
   else{
     try{ db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
-    catch(e){ db = { users: [], streaks: {}, stories: [], questions: [] }; }
+    catch(e){ db = blank; }
   }
   if(!Array.isArray(db.stories)) db.stories = []; // back-compat with data.json files saved before this feature existed
   if(!Array.isArray(db.questions)) db.questions = []; // back-compat with data.json files saved before this feature existed
+  if(!db.visits || typeof db.visits !== 'object') db.visits = { total: 0, uniqueIds: [] }; // back-compat
+  if(!Array.isArray(db.visits.uniqueIds)) db.visits.uniqueIds = [];
+  if(typeof db.visits.total !== 'number') db.visits.total = 0;
   return db;
+}
+
+// Who's on the app right now — kept in memory only, never written to disk. It resets
+// on every server restart/redeploy, which is fine: "live right now" isn't meant to be
+// a historical record, just this instant.
+const liveVisitors = new Map(); // visitorId -> last-seen timestamp (ms)
+const LIVE_WINDOW_MS = 60 * 1000; // counted as "live" if seen in the last 60 seconds
+function countLiveVisitors(){
+  const cutoff = Date.now() - LIVE_WINDOW_MS;
+  let count = 0;
+  for(const [id, lastSeen] of liveVisitors){
+    if(lastSeen >= cutoff) count++;
+    else liveVisitors.delete(id); // prune while we're here, keeps the map small
+  }
+  return count;
 }
 function saveDB(db){
   fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
@@ -317,6 +336,42 @@ app.post('/api/admin/questions/:id/status', authMiddleware, adminMiddleware, (re
   entry.status = status;
   saveDB(db);
   res.json({ question: entry });
+});
+
+/* ---------------- Traffic: visits, live count, admin dashboard ---------------- */
+// visitorId is a random ID the app generates once per device and stores locally
+// (not personal info, just a way to tell "one more open" from "one more person").
+app.post('/api/visit', (req, res) => {
+  const { visitorId } = req.body || {};
+  const id = String(visitorId || '').slice(0, 100);
+  const db = loadDB();
+  db.visits.total += 1;
+  if(id && !db.visits.uniqueIds.includes(id)){
+    db.visits.uniqueIds.push(id);
+    if(db.visits.uniqueIds.length > 100000) db.visits.uniqueIds = db.visits.uniqueIds.slice(-100000);
+  }
+  saveDB(db);
+  if(id) liveVisitors.set(id, Date.now());
+  res.json({ ok: true });
+});
+
+app.post('/api/heartbeat', (req, res) => {
+  const { visitorId } = req.body || {};
+  const id = String(visitorId || '').slice(0, 100);
+  if(id) liveVisitors.set(id, Date.now());
+  res.json({ ok: true }); // no disk write here on purpose — this fires every ~20s per open tab
+});
+
+app.get('/api/admin/stats', authMiddleware, adminMiddleware, (req, res) => {
+  const db = loadDB();
+  res.json({
+    totalUsers: db.users.length,
+    totalVisits: db.visits.total,
+    uniqueVisitors: db.visits.uniqueIds.length,
+    liveNow: countLiveVisitors(),
+    pendingStories: db.stories.filter(s => s.status === 'pending').length,
+    pendingQuestions: db.questions.filter(q => q.status === 'pending').length,
+  });
 });
 
 /* ---------------- LegiScan bill-tracking feed ---------------- */

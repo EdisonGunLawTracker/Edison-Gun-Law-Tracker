@@ -85,7 +85,27 @@ is visible in the app.
 | `/api/leaderboard` | GET | none | Public top-25 by streak |
 | `/api/streak` | POST | Bearer token | Records today's daily-question result |
 | `/api/admin/users` | GET | Bearer token, admin only | Full user list |
-| `/api/stories` | POST | none | Submit a "pulled over" story/video-link for review |
-| `/api/stories` | GET | none | Public feed — approved stories only |
-| `/api/admin/stories` | GET | Bearer token, admin only | All submissions, including pending |
-| `/api/admin/stories/:id/status` | POST | Bearer token, admin only | Approve or reject a submission (`{"status":"approved"}`) |
+| `/api/stories` | POST | none | Submit a pulled-over story for review |
+| `/api/stories` | GET | none | Public feed of approved stories |
+| `/api/admin/stories` | GET | Bearer token, admin only | Full story list, any status |
+| `/api/admin/stories/:id/status` | POST | Bearer token, admin only | Approve/reject a story |
+| `/api/questions` | POST | none | Submit a question for Antonio to answer |
+| `/api/questions` | GET | none | Public feed of answered questions |
+| `/api/admin/questions` | GET | Bearer token, admin only | Full question list, any status |
+| `/api/admin/questions/:id/answer` | POST | Bearer token, admin only | Post an answer (publishes it) |
+| `/api/admin/questions/:id/status` | POST | Bearer token, admin only | Reject a question without answering |
+| `/api/visit` | POST | none | Records one app open, and marks that device "live" |
+| `/api/heartbeat` | POST | none | Refreshes a device's "live" status (called every ~20s while the app is open, no disk write) |
+| `/api/admin/stats` | GET | Bearer token, admin only | Dashboard tab's numbers: total users, total visits, unique visitors, live-right-now count, pending stories, pending questions |
+
+## A note on the traffic numbers
+
+`totalVisits` and `uniqueVisitors` are stored in the same `data.json` file as everything else, so
+they're only as durable as that file — see "What this is not" above. `liveNow` (who's on the app
+*right now*) isn't stored on disk at all; it lives in memory and resets to 0 every time the server
+restarts or redeploys. On Render's free tier specifically, the whole filesystem is ephemeral, so a
+redeploy (or the free-tier sleep/wake cycle) can also wipe `data.json` itself, taking the visit
+counts with it. None of this breaks anything — the app just starts counting again from zero — but
+if Antonio ever wants these numbers to survive restarts, the fix is the same one already called out
+above: move from the JSON file to a real database with a persistent disk (Postgres via Supabase or
+Neon).
