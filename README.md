@@ -85,3 +85,7 @@ is visible in the app.
 | `/api/leaderboard` | GET | none | Public top-25 by streak |
 | `/api/streak` | POST | Bearer token | Records today's daily-question result |
 | `/api/admin/users` | GET | Bearer token, admin only | Full user list |
+| `/api/stories` | POST | none | Submit a "pulled over" story/video-link for review |
+| `/api/stories` | GET | none | Public feed — approved stories only |
+| `/api/admin/stories` | GET | Bearer token, admin only | All submissions, including pending |
+| `/api/admin/stories/:id/status` | POST | Bearer token, admin only | Approve or reject a submission (`{"status":"approved"}`) |

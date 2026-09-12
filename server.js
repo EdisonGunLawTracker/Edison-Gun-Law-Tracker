@@ -40,9 +40,14 @@ if(JWT_SECRET === 'change-this-before-you-deploy'){
 }
 
 function loadDB(){
-  if(!fs.existsSync(DB_FILE)) return { users: [], streaks: {} };
-  try{ return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
-  catch(e){ return { users: [], streaks: {} }; }
+  let db;
+  if(!fs.existsSync(DB_FILE)) db = { users: [], streaks: {}, stories: [] };
+  else{
+    try{ db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
+    catch(e){ db = { users: [], streaks: {}, stories: [] }; }
+  }
+  if(!Array.isArray(db.stories)) db.stories = []; // back-compat with data.json files saved before this feature existed
+  return db;
 }
 function saveDB(db){
   fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
@@ -168,6 +173,74 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, (req, res) => {
       longestStreak: (db.streaks[u.id] || {}).longestStreak || 0,
     })),
   });
+});
+
+/* ---------------- Pulled-over stories (community, admin-moderated) ---------------- */
+// Anyone can submit — no account needed, so it's usable in the moment right after a
+// stop. Nothing shows up in the public feed until an admin (ADMIN_EMAIL) approves it
+// via the /api/admin/stories routes below.
+function isHttpUrl(str){
+  try{ const u = new URL(str); return u.protocol === 'http:' || u.protocol === 'https:'; }
+  catch(e){ return false; }
+}
+
+app.post('/api/stories', (req, res) => {
+  const { state, story, videoLink, displayName, contactEmail, website } = req.body || {};
+  if(website) return res.json({ ok: true }); // honeypot field — bots fill it, real users never see it
+
+  const storyText = String(story || '').trim();
+  if(storyText.length < 20 || storyText.length > 2000){
+    return res.status(400).json({ error: 'Tell us what happened in 20–2000 characters.' });
+  }
+  const stateAbbr = /^[A-Za-z]{2}$/.test(String(state || '')) ? String(state).toUpperCase() : null;
+  const link = String(videoLink || '').trim().slice(0, 500);
+  if(link && !isHttpUrl(link)){
+    return res.status(400).json({ error: 'That video link needs to start with http:// or https://.' });
+  }
+  const name = String(displayName || '').trim().slice(0, 40) || 'Anonymous';
+  const email = String(contactEmail || '').trim().slice(0, 200);
+
+  const db = loadDB();
+  db.stories.push({
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+    state: stateAbbr,
+    story: storyText,
+    videoLink: link || null,
+    displayName: name,
+    contactEmail: email || null,
+    status: 'pending',
+    createdAt: new Date().toISOString(),
+  });
+  if(db.stories.length > 2000) db.stories = db.stories.slice(-2000); // keep the file from growing forever
+  saveDB(db);
+  res.json({ ok: true });
+});
+
+app.get('/api/stories', (req, res) => {
+  const db = loadDB();
+  const approved = db.stories
+    .filter(s => s.status === 'approved')
+    .slice().reverse().slice(0, 200)
+    .map(s => ({ id: s.id, state: s.state, story: s.story, videoLink: s.videoLink, displayName: s.displayName, createdAt: s.createdAt }));
+  res.json({ stories: approved });
+});
+
+app.get('/api/admin/stories', authMiddleware, adminMiddleware, (req, res) => {
+  const db = loadDB();
+  res.json({ stories: db.stories.slice().reverse() });
+});
+
+app.post('/api/admin/stories/:id/status', authMiddleware, adminMiddleware, (req, res) => {
+  const { status } = req.body || {};
+  if(!['pending', 'approved', 'rejected'].includes(status)){
+    return res.status(400).json({ error: 'status must be pending, approved, or rejected.' });
+  }
+  const db = loadDB();
+  const entry = db.stories.find(s => s.id === req.params.id);
+  if(!entry) return res.status(404).json({ error: 'Story not found.' });
+  entry.status = status;
+  saveDB(db);
+  res.json({ story: entry });
 });
 
 /* ---------------- LegiScan bill-tracking feed ---------------- */
