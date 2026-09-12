@@ -41,12 +41,13 @@ if(JWT_SECRET === 'change-this-before-you-deploy'){
 
 function loadDB(){
   let db;
-  if(!fs.existsSync(DB_FILE)) db = { users: [], streaks: {}, stories: [] };
+  if(!fs.existsSync(DB_FILE)) db = { users: [], streaks: {}, stories: [], questions: [] };
   else{
     try{ db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
-    catch(e){ db = { users: [], streaks: {}, stories: [] }; }
+    catch(e){ db = { users: [], streaks: {}, stories: [], questions: [] }; }
   }
   if(!Array.isArray(db.stories)) db.stories = []; // back-compat with data.json files saved before this feature existed
+  if(!Array.isArray(db.questions)) db.questions = []; // back-compat with data.json files saved before this feature existed
   return db;
 }
 function saveDB(db){
@@ -241,6 +242,81 @@ app.post('/api/admin/stories/:id/status', authMiddleware, adminMiddleware, (req,
   entry.status = status;
   saveDB(db);
   res.json({ story: entry });
+});
+
+/* ---------------- Ask a Question ---------------- */
+// Instant answers for common questions are computed client-side straight from the
+// app's own already-vetted state data (see ASK_TOPICS in index.html) — nothing here
+// invents a legal fact. This is only for the fallback: a free-text question that
+// didn't match one of those topics, which Antonio answers personally.
+app.post('/api/questions', (req, res) => {
+  const { question, state, contactEmail, website } = req.body || {};
+  if(website) return res.json({ ok: true }); // honeypot field — bots fill it, real users never see it
+
+  const questionText = String(question || '').trim();
+  if(questionText.length < 10 || questionText.length > 500){
+    return res.status(400).json({ error: 'Ask your question in 10–500 characters.' });
+  }
+  const stateAbbr = /^[A-Za-z]{2}$/.test(String(state || '')) ? String(state).toUpperCase() : null;
+  const email = String(contactEmail || '').trim().slice(0, 200);
+
+  const db = loadDB();
+  db.questions.push({
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+    question: questionText,
+    state: stateAbbr,
+    contactEmail: email || null,
+    status: 'pending',
+    answer: null,
+    createdAt: new Date().toISOString(),
+    answeredAt: null,
+  });
+  if(db.questions.length > 2000) db.questions = db.questions.slice(-2000); // keep the file from growing forever
+  saveDB(db);
+  res.json({ ok: true });
+});
+
+app.get('/api/questions', (req, res) => {
+  const db = loadDB();
+  const answered = db.questions
+    .filter(q => q.status === 'answered')
+    .slice().reverse().slice(0, 200)
+    .map(q => ({ id: q.id, state: q.state, question: q.question, answer: q.answer, createdAt: q.createdAt, answeredAt: q.answeredAt }));
+  res.json({ questions: answered });
+});
+
+app.get('/api/admin/questions', authMiddleware, adminMiddleware, (req, res) => {
+  const db = loadDB();
+  res.json({ questions: db.questions.slice().reverse() });
+});
+
+app.post('/api/admin/questions/:id/answer', authMiddleware, adminMiddleware, (req, res) => {
+  const { answer } = req.body || {};
+  const answerText = String(answer || '').trim();
+  if(answerText.length < 3 || answerText.length > 3000){
+    return res.status(400).json({ error: 'Answer must be 3–3000 characters.' });
+  }
+  const db = loadDB();
+  const entry = db.questions.find(q => q.id === req.params.id);
+  if(!entry) return res.status(404).json({ error: 'Question not found.' });
+  entry.answer = answerText;
+  entry.status = 'answered';
+  entry.answeredAt = new Date().toISOString();
+  saveDB(db);
+  res.json({ question: entry });
+});
+
+app.post('/api/admin/questions/:id/status', authMiddleware, adminMiddleware, (req, res) => {
+  const { status } = req.body || {};
+  if(!['pending', 'answered', 'rejected'].includes(status)){
+    return res.status(400).json({ error: 'status must be pending, answered, or rejected.' });
+  }
+  const db = loadDB();
+  const entry = db.questions.find(q => q.id === req.params.id);
+  if(!entry) return res.status(404).json({ error: 'Question not found.' });
+  entry.status = status;
+  saveDB(db);
+  res.json({ question: entry });
 });
 
 /* ---------------- LegiScan bill-tracking feed ---------------- */
