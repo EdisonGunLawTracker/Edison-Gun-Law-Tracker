@@ -41,7 +41,7 @@ if(JWT_SECRET === 'change-this-before-you-deploy'){
 
 function loadDB(){
   let db;
-  const blank = { users: [], streaks: {}, stories: [], questions: [], visits: { total: 0, uniqueIds: [] } };
+  const blank = { users: [], streaks: {}, stories: [], questions: [], adInquiries: [], visits: { total: 0, uniqueIds: [] } };
   if(!fs.existsSync(DB_FILE)) db = blank;
   else{
     try{ db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
@@ -49,9 +49,16 @@ function loadDB(){
   }
   if(!Array.isArray(db.stories)) db.stories = []; // back-compat with data.json files saved before this feature existed
   if(!Array.isArray(db.questions)) db.questions = []; // back-compat with data.json files saved before this feature existed
+  if(!Array.isArray(db.adInquiries)) db.adInquiries = []; // back-compat with data.json files saved before this feature existed
   if(!db.visits || typeof db.visits !== 'object') db.visits = { total: 0, uniqueIds: [] }; // back-compat
   if(!Array.isArray(db.visits.uniqueIds)) db.visits.uniqueIds = [];
   if(typeof db.visits.total !== 'number') db.visits.total = 0;
+  if(Array.isArray(db.users)){
+    db.users.forEach(u => { // back-compat with accounts created before membership existed
+      if(typeof u.isMember !== 'boolean') u.isMember = false;
+      if(typeof u.showOnWall !== 'boolean') u.showOnWall = false;
+    });
+  }
   return db;
 }
 
@@ -74,7 +81,7 @@ function saveDB(db){
 }
 
 function publicUser(u){
-  return { id: u.id, email: u.email, displayName: u.displayName, isAdmin: !!u.isAdmin, createdAt: u.createdAt };
+  return { id: u.id, email: u.email, displayName: u.displayName, isAdmin: !!u.isAdmin, isMember: !!u.isMember, showOnWall: !!u.showOnWall, createdAt: u.createdAt };
 }
 
 function authMiddleware(req, res, next){
@@ -91,6 +98,19 @@ function authMiddleware(req, res, next){
 
 function adminMiddleware(req, res, next){
   if(!req.user || !req.user.isAdmin) return res.status(403).json({ error: 'Admins only.' });
+  next();
+}
+
+// Like authMiddleware, but never rejects the request — it just attaches req.user when a
+// valid token is present. Used on routes anyone can call, where we still want to know
+// (for example) whether a submitter is a signed-in member, without requiring login.
+function optionalAuth(req, res, next){
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if(token){
+    try{ req.user = jwt.verify(token, JWT_SECRET); }
+    catch(e){ /* invalid/expired token — proceed as anonymous, don't block the request */ }
+  }
   next();
 }
 
@@ -115,6 +135,8 @@ app.post('/api/register', (req, res) => {
     displayName: name,
     passwordHash: bcrypt.hashSync(String(password), 10),
     isAdmin,
+    isMember: false, // members are granted manually by the admin in the Dashboard tab (no Patreon API hookup)
+    showOnWall: false, // opt-in: show this name on the public Supporters Wall
     createdAt: new Date().toISOString(),
   };
   db.users.push(user);
@@ -195,6 +217,48 @@ app.get('/api/admin/users', authMiddleware, adminMiddleware, (req, res) => {
   });
 });
 
+// Membership perks (Patreon, $3.99/mo) aren't verified against Patreon itself — there's no
+// API hookup for that — so this is the manual switch: check your Patreon patron list, then
+// flip this on for that person's account here. It unlocks: the member badge, priority on
+// submitted questions, the printable state one-pager, and (if they opt in) a line on the
+// public Supporters Wall.
+app.post('/api/admin/users/:id/member', authMiddleware, adminMiddleware, (req, res) => {
+  const { isMember } = req.body || {};
+  const db = loadDB();
+  const user = db.users.find(u => u.id === req.params.id);
+  if(!user) return res.status(404).json({ error: 'User not found.' });
+  user.isMember = !!isMember;
+  if(!user.isMember) user.showOnWall = false; // no longer a member — drop them from the wall too
+  saveDB(db);
+  res.json({ user: publicUser(user) });
+});
+
+// Self-service: a member opts in/out of appearing on the public Supporters Wall.
+app.post('/api/me/wall', authMiddleware, (req, res) => {
+  const { show } = req.body || {};
+  const db = loadDB();
+  const user = db.users.find(u => u.id === req.user.id);
+  if(!user) return res.status(404).json({ error: 'User not found.' });
+  if(!user.isMember){
+    return res.status(403).json({ error: 'Only members can join the Supporters Wall.' });
+  }
+  user.showOnWall = !!show;
+  saveDB(db);
+  res.json({ user: publicUser(user) });
+});
+
+// Public: first names/display names of members who opted in, oldest member first (a
+// rough "founding members" ordering) — no emails, no other account details.
+app.get('/api/supporters', (req, res) => {
+  const db = loadDB();
+  const supporters = db.users
+    .filter(u => u.isMember && u.showOnWall)
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+    .slice(0, 300)
+    .map(u => ({ displayName: u.displayName, since: u.createdAt }));
+  res.json({ supporters });
+});
+
 /* ---------------- Pulled-over stories (community, admin-moderated) ---------------- */
 // Anyone can submit — no account needed, so it's usable in the moment right after a
 // stop. Nothing shows up in the public feed until an admin (ADMIN_EMAIL) approves it
@@ -268,7 +332,7 @@ app.post('/api/admin/stories/:id/status', authMiddleware, adminMiddleware, (req,
 // app's own already-vetted state data (see ASK_TOPICS in index.html) — nothing here
 // invents a legal fact. This is only for the fallback: a free-text question that
 // didn't match one of those topics, which Antonio answers personally.
-app.post('/api/questions', (req, res) => {
+app.post('/api/questions', optionalAuth, (req, res) => {
   const { question, state, contactEmail, website } = req.body || {};
   if(website) return res.json({ ok: true }); // honeypot field — bots fill it, real users never see it
 
@@ -278,6 +342,7 @@ app.post('/api/questions', (req, res) => {
   }
   const stateAbbr = /^[A-Za-z]{2}$/.test(String(state || '')) ? String(state).toUpperCase() : null;
   const email = String(contactEmail || '').trim().slice(0, 200);
+  const isPriority = !!(req.user && req.user.isMember); // member perk: jumps the queue — see /api/admin/questions sort
 
   const db = loadDB();
   db.questions.push({
@@ -286,6 +351,7 @@ app.post('/api/questions', (req, res) => {
     state: stateAbbr,
     contactEmail: email || null,
     status: 'pending',
+    priority: isPriority,
     answer: null,
     createdAt: new Date().toISOString(),
     answeredAt: null,
@@ -306,7 +372,14 @@ app.get('/api/questions', (req, res) => {
 
 app.get('/api/admin/questions', authMiddleware, adminMiddleware, (req, res) => {
   const db = loadDB();
-  res.json({ questions: db.questions.slice().reverse() });
+  // Member perk: pending questions from members ("priority") sort to the top, newest
+  // first; everything else follows in its normal newest-first order underneath.
+  const sorted = db.questions.slice().reverse().sort((a, b) => {
+    const aTop = a.status === 'pending' && a.priority ? 1 : 0;
+    const bTop = b.status === 'pending' && b.priority ? 1 : 0;
+    return bTop - aTop;
+  });
+  res.json({ questions: sorted });
 });
 
 app.post('/api/admin/questions/:id/answer', authMiddleware, adminMiddleware, (req, res) => {
@@ -336,6 +409,57 @@ app.post('/api/admin/questions/:id/status', authMiddleware, adminMiddleware, (re
   entry.status = status;
   saveDB(db);
   res.json({ question: entry });
+});
+
+/* ---------------- Advertise with us (local business inquiries) ---------------- */
+// A lead-capture form, not a self-serve ad system — inquiries land in an admin-only
+// inbox for Antonio to follow up with personally. Nothing here displays publicly.
+app.post('/api/ad-inquiries', (req, res) => {
+  const { businessName, contact, website, message, website2 } = req.body || {};
+  if(website2) return res.json({ ok: true }); // honeypot field — bots fill it, real users never see it
+
+  const name = String(businessName || '').trim().slice(0, 120);
+  const contactInfo = String(contact || '').trim().slice(0, 200);
+  const messageText = String(message || '').trim();
+  if(!name || !contactInfo){
+    return res.status(400).json({ error: 'Business name and a way to reach you are both required.' });
+  }
+  if(messageText.length < 10 || messageText.length > 500){
+    return res.status(400).json({ error: 'Tell us what you\'re interested in, in 10–500 characters.' });
+  }
+  const site = String(website || '').trim().slice(0, 300);
+
+  const db = loadDB();
+  db.adInquiries.push({
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+    businessName: name,
+    contact: contactInfo,
+    website: site || null,
+    message: messageText,
+    status: 'pending',
+    createdAt: new Date().toISOString(),
+  });
+  if(db.adInquiries.length > 2000) db.adInquiries = db.adInquiries.slice(-2000);
+  saveDB(db);
+  res.json({ ok: true });
+});
+
+app.get('/api/admin/ad-inquiries', authMiddleware, adminMiddleware, (req, res) => {
+  const db = loadDB();
+  res.json({ inquiries: db.adInquiries.slice().reverse() });
+});
+
+app.post('/api/admin/ad-inquiries/:id/status', authMiddleware, adminMiddleware, (req, res) => {
+  const { status } = req.body || {};
+  if(!['pending', 'contacted', 'closed'].includes(status)){
+    return res.status(400).json({ error: 'status must be pending, contacted, or closed.' });
+  }
+  const db = loadDB();
+  const entry = db.adInquiries.find(a => a.id === req.params.id);
+  if(!entry) return res.status(404).json({ error: 'Inquiry not found.' });
+  entry.status = status;
+  saveDB(db);
+  res.json({ inquiry: entry });
 });
 
 /* ---------------- Traffic: visits, live count, admin dashboard ---------------- */
@@ -371,6 +495,7 @@ app.get('/api/admin/stats', authMiddleware, adminMiddleware, (req, res) => {
     liveNow: countLiveVisitors(),
     pendingStories: db.stories.filter(s => s.status === 'pending').length,
     pendingQuestions: db.questions.filter(q => q.status === 'pending').length,
+    pendingAdInquiries: db.adInquiries.filter(a => a.status === 'pending').length,
   });
 });
 

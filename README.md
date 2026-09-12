@@ -96,7 +96,27 @@ is visible in the app.
 | `/api/admin/questions/:id/status` | POST | Bearer token, admin only | Reject a question without answering |
 | `/api/visit` | POST | none | Records one app open, and marks that device "live" |
 | `/api/heartbeat` | POST | none | Refreshes a device's "live" status (called every ~20s while the app is open, no disk write) |
-| `/api/admin/stats` | GET | Bearer token, admin only | Dashboard tab's numbers: total users, total visits, unique visitors, live-right-now count, pending stories, pending questions |
+| `/api/admin/stats` | GET | Bearer token, admin only | Dashboard tab's numbers: total users, total visits, unique visitors, live-right-now count, pending stories, pending questions, pending ad inquiries |
+| `/api/admin/users/:id/member` | POST | Bearer token, admin only | Grant/revoke membership on an account (`{isMember: true/false}`) — the manual switch since there's no Patreon API hookup |
+| `/api/me/wall` | POST | Bearer token (must be a member) | Opt in/out of the public Supporters Wall (`{show: true/false}`) |
+| `/api/supporters` | GET | none | Public list of members who opted into the Supporters Wall |
+| `/api/ad-inquiries` | POST | none | A local business submits an "Advertise with us" lead |
+| `/api/admin/ad-inquiries` | GET | Bearer token, admin only | Full list of ad inquiries |
+| `/api/admin/ad-inquiries/:id/status` | POST | Bearer token, admin only | Mark an inquiry contacted/closed |
+
+## Membership perks, and how they're actually gated
+
+There's no Patreon API integration here — checking whether someone's subscription is
+active isn't wired up automatically. Instead, membership is a manual flag on their
+account (`isMember`) that you switch on yourself in the Dashboard tab's user list, after
+checking your Patreon patron list. Once granted, it unlocks: the member badge next to
+their name, priority placement for questions they submit through "Ask a Question" (see
+`/api/admin/questions`'s sort, which puts pending member questions on top), the
+printable one-page state summary, and — if they opt in — a line on the public
+Supporters Wall. The existing "Unlock perks on this device" honor-system flag (anyone
+can type any email and flip it on) still works too, and either signal unlocks perks —
+that one was already live before this round of features and hasn't been changed, just
+left in place as a lightweight option for someone who doesn't want to make an account.
 
 ## A note on the traffic numbers
 
