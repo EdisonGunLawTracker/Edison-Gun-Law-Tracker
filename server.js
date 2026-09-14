@@ -89,7 +89,7 @@ if(!supabase){
 }
 
 function blankDB(){
-  return { users: [], streaks: {}, stories: [], questions: [], adInquiries: [], feedback: [], photos: [], stateViews: {}, tabViews: {}, visits: { total: 0, uniqueIds: [] } };
+  return { users: [], streaks: {}, stories: [], questions: [], adInquiries: [], feedback: [], photos: [], stateViews: {}, tabViews: {}, visits: { total: 0, uniqueIds: [] }, gameScores: {} };
 }
 
 function applyBackCompat(db){
@@ -103,6 +103,7 @@ function applyBackCompat(db){
   if(!Array.isArray(db.photos)) db.photos = []; // back-compat with data saved before this feature existed
   if(!db.stateViews || typeof db.stateViews !== 'object') db.stateViews = {}; // back-compat
   if(!db.tabViews || typeof db.tabViews !== 'object') db.tabViews = {}; // back-compat
+  if(!db.gameScores || typeof db.gameScores !== 'object') db.gameScores = {}; // back-compat — State Law Trivia + future games' scores, keyed by user id
   if(!db.visits || typeof db.visits !== 'object') db.visits = { total: 0, uniqueIds: [] }; // back-compat
   if(!Array.isArray(db.visits.uniqueIds)) db.visits.uniqueIds = [];
   if(typeof db.visits.total !== 'number') db.visits.total = 0;
@@ -175,9 +176,17 @@ function countLiveVisitors(){
   }
   return count;
 }
-function saveDB(db){
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
-}
+// NOTE (2026-09-14, found during the State Law Trivia build): a second, older `function saveDB(db){...}`
+// used to sit right here, writing straight to the local data.json file. In JavaScript, when two top-level
+// function declarations share a name, the LAST one in the file silently wins for every call anywhere in
+// the script — so that leftover copy was quietly overriding the real Supabase-mirroring saveDB() defined
+// above, meaning every save since it landed has been going to the local file only, never to Supabase. That
+// undoes the whole point of the Supabase migration: on the next restart/redeploy, initStorage() reloads
+// whatever is still in Supabase (nothing since that leftover copy was introduced) and any signups/data
+// saved since then are gone. Removed the duplicate. Antonio: this needs a redeploy to actually take effect
+// in production, and is worth testing for real this time (restart the Render service and confirm a fresh
+// signup survives) rather than trusting the startup log line alone, since that line was never proof this
+// bug wasn't there.
 
 function publicUser(u){
   return {
@@ -259,6 +268,14 @@ app.post('/api/login', authLimiter, (req, res) => {
   if(!user || !bcrypt.compareSync(String(password || ''), user.passwordHash)){
     return res.status(401).json({ error: 'Incorrect email or password.' });
   }
+  // Fresh login resets this account's State Law Trivia round count — see the
+  // "3 rounds per login" rule on the /api/games/state-trivia/round route below.
+  if(!db.gameScores[user.id]){
+    db.gameScores[user.id] = { totalScore: 0, roundsPlayedSinceLogin: 0, roundsAllTime: 0, correctAllTime: 0, totalAllTime: 0, lastPlayedAt: null };
+  } else {
+    db.gameScores[user.id].roundsPlayedSinceLogin = 0;
+  }
+  saveDB(db);
   const token = jwt.sign(publicUser(user), JWT_SECRET, { expiresIn: '30d' });
   res.json({ token, user: publicUser(user) });
 });
@@ -307,6 +324,59 @@ app.post('/api/streak', authMiddleware, (req, res) => {
   db.streaks[req.user.id] = updated;
   saveDB(db);
   res.json({ progress: updated });
+});
+
+/* ---------------- Games: overall score shared across every in-app game (State Law Trivia today,
+   room for more later) — separate from the daily-question streak above, which is its own thing. ---------------- */
+
+// One round = up to 10 multiple-choice questions the frontend already graded client-side (the
+// question bank is just STATES/CARRY_INFO/SD_INFO/etc. already shipped to the browser, so there's
+// nothing secret to check server-side). This route just records the result and enforces the
+// "3 rounds per login" rule Antonio asked for: /api/login above resets roundsPlayedSinceLogin to 0
+// every time someone logs in, and this route refuses a 4th round until their next login.
+app.post('/api/games/state-trivia/round', authMiddleware, (req, res) => {
+  const { correct, total } = req.body || {};
+  const correctNum = Number(correct), totalNum = Number(total);
+  if(!Number.isInteger(correctNum) || !Number.isInteger(totalNum) || totalNum < 1 || totalNum > 10 || correctNum < 0 || correctNum > totalNum){
+    return res.status(400).json({ error: 'Invalid round result.' });
+  }
+  const db = loadDB();
+  const entry = db.gameScores[req.user.id] || { totalScore: 0, roundsPlayedSinceLogin: 0, roundsAllTime: 0, correctAllTime: 0, totalAllTime: 0, lastPlayedAt: null };
+  if(entry.roundsPlayedSinceLogin >= 3){
+    return res.status(403).json({ error: "You've played all 3 rounds for this login — log out and back in, or come back another time, for more." });
+  }
+  entry.roundsPlayedSinceLogin += 1;
+  entry.roundsAllTime += 1;
+  entry.correctAllTime += correctNum;
+  entry.totalAllTime += totalNum;
+  entry.totalScore += correctNum; // simple, transparent scoring: 1 point per correct answer, same unit every game on this leaderboard uses
+  entry.lastPlayedAt = new Date().toISOString();
+  db.gameScores[req.user.id] = entry;
+  saveDB(db);
+  res.json({ score: entry, roundsRemaining: Math.max(0, 3 - entry.roundsPlayedSinceLogin) });
+});
+
+// The signed-in user's own score summary — used by the Scores tab so someone who hasn't played
+// yet still sees "0" instead of nothing, without that "0" ever being written to the database.
+app.get('/api/games/me', authMiddleware, (req, res) => {
+  const db = loadDB();
+  const entry = db.gameScores[req.user.id] || { totalScore: 0, roundsPlayedSinceLogin: 0, roundsAllTime: 0, correctAllTime: 0, totalAllTime: 0, lastPlayedAt: null };
+  res.json({ score: entry, roundsRemaining: Math.max(0, 3 - entry.roundsPlayedSinceLogin) });
+});
+
+// Public overall-score leaderboard — combines every game that reports into gameScores (just
+// State Law Trivia for now). Same shape/pattern as /api/leaderboard above.
+app.get('/api/games/leaderboard', (req, res) => {
+  const db = loadDB();
+  const rows = Object.entries(db.gameScores)
+    .map(([userId, s]) => {
+      const user = db.users.find(u => u.id === userId);
+      return user && s.totalScore > 0 ? { name: user.displayName, totalScore: s.totalScore || 0 } : null;
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.totalScore - a.totalScore)
+    .slice(0, 25);
+  res.json({ leaderboard: rows });
 });
 
 /* ---------------- Admin only ---------------- */
