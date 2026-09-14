@@ -32,10 +32,43 @@ const jwt = require('jsonwebtoken');
 const fs = require('fs');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+/**
+ * Rate limiting — added 2026-09-14, closes the "no rate limiting anywhere"
+ * item flagged in Security - App Security Watch.md (finding #4, 2026-09-13).
+ * Render sits behind a proxy, so req.ip needs the real client address —
+ * `trust proxy` makes express-rate-limit key on the actual visitor instead
+ * of Render's proxy IP for everyone at once.
+ */
+app.set('trust proxy', 1);
+
+// Login/register: a real user rarely needs more than a handful of attempts
+// in 15 minutes. Tight enough to blunt brute-forcing and credential-stuffing,
+// loose enough that a person who fat-fingers their password a few times
+// never notices this exists.
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts — please wait a few minutes and try again.' },
+});
+
+// Public submission endpoints (stories, questions, ad inquiries, feedback,
+// photos): generous enough for a real person submitting a handful of things,
+// tight enough to stop a script from flooding the admin review queues.
+const submitLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many submissions from this connection — please try again later.' },
+});
 
 const JWT_SECRET = process.env.JWT_SECRET || 'change-this-before-you-deploy';
 const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '').toLowerCase().trim();
@@ -187,7 +220,7 @@ function optionalAuth(req, res, next){
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 /* ---------------- Auth ---------------- */
-app.post('/api/register', (req, res) => {
+app.post('/api/register', authLimiter, (req, res) => {
   const { email, password, displayName } = req.body || {};
   const emailLower = String(email || '').toLowerCase().trim();
   if(!emailLower || !password || String(password).length < 6){
@@ -218,7 +251,7 @@ app.post('/api/register', (req, res) => {
   res.json({ token, user: publicUser(user) });
 });
 
-app.post('/api/login', (req, res) => {
+app.post('/api/login', authLimiter, (req, res) => {
   const { email, password } = req.body || {};
   const emailLower = String(email || '').toLowerCase().trim();
   const db = loadDB();
@@ -380,7 +413,7 @@ function isHttpUrl(str){
   catch(e){ return false; }
 }
 
-app.post('/api/stories', (req, res) => {
+app.post('/api/stories', submitLimiter, (req, res) => {
   const { state, story, videoLink, displayName, contactEmail, website } = req.body || {};
   if(website) return res.json({ ok: true }); // honeypot field — bots fill it, real users never see it
 
@@ -444,7 +477,7 @@ app.post('/api/admin/stories/:id/status', authMiddleware, adminMiddleware, (req,
 // app's own already-vetted state data (see ASK_TOPICS in index.html) — nothing here
 // invents a legal fact. This is only for the fallback: a free-text question that
 // didn't match one of those topics, which Antonio answers personally.
-app.post('/api/questions', optionalAuth, (req, res) => {
+app.post('/api/questions', submitLimiter, optionalAuth, (req, res) => {
   const { question, state, contactEmail, website } = req.body || {};
   if(website) return res.json({ ok: true }); // honeypot field — bots fill it, real users never see it
 
@@ -526,7 +559,7 @@ app.post('/api/admin/questions/:id/status', authMiddleware, adminMiddleware, (re
 /* ---------------- Advertise with us (local business inquiries) ---------------- */
 // A lead-capture form, not a self-serve ad system — inquiries land in an admin-only
 // inbox for Antonio to follow up with personally. Nothing here displays publicly.
-app.post('/api/ad-inquiries', (req, res) => {
+app.post('/api/ad-inquiries', submitLimiter, (req, res) => {
   const { businessName, contact, website, message, website2 } = req.body || {};
   if(website2) return res.json({ ok: true }); // honeypot field — bots fill it, real users never see it
 
@@ -578,7 +611,7 @@ app.post('/api/admin/ad-inquiries/:id/status', authMiddleware, adminMiddleware, 
 // General "tell us what you think" feedback — bugs, feature requests, praise, whatever.
 // Anyone can submit, no account needed. Nothing here is ever shown publicly; it's an
 // admin-only inbox, same shape as the ad-inquiries one above.
-app.post('/api/feedback', (req, res) => {
+app.post('/api/feedback', submitLimiter, (req, res) => {
   const { category, message, contactEmail, website } = req.body || {};
   if(website) return res.json({ ok: true }); // honeypot field — bots fill it, real users never see it
 
@@ -626,7 +659,7 @@ app.post('/api/admin/feedback/:id/status', authMiddleware, adminMiddleware, (req
 // Same "paste a link to something already hosted" pattern as the pulled-over stories'
 // video link — no file upload, no hosting account needed on our end. Admin-approved
 // before anything shows up on the public Community tab.
-app.post('/api/photos', (req, res) => {
+app.post('/api/photos', submitLimiter, (req, res) => {
   const { photoLink, caption, state, displayName, website } = req.body || {};
   if(website) return res.json({ ok: true }); // honeypot field
 
