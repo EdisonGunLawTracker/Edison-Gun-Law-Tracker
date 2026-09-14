@@ -4,16 +4,23 @@
  * Real accounts, real password hashing (bcrypt), real signed sessions (JWT),
  * and one admin-only route that only the account matching ADMIN_EMAIL can use.
  *
- * Storage: a single JSON file (data.json) next to this script. That's enough
- * for a small user base and zero setup — no database server to run. If this
- * app ever gets real traffic, swap loadDB()/saveDB() for a real database
- * (Postgres via Supabase/Neon is a easy, free-tier-friendly next step) —
- * everything else in this file stays the same.
+ * Storage: everything lives in one JSON blob, kept in memory while the server
+ * runs and mirrored to a Supabase Postgres table ("app_state") on every save.
+ * That's what makes signups (and everything else) survive a restart/redeploy —
+ * a plain data.json file next to this script does NOT survive that on Render
+ * (or most hosts): the disk resets to the last deploy on every restart, which
+ * on Render's free plan also happens automatically after ~15 minutes idle.
+ * If SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY aren't set, this falls back to
+ * that old local file so the app still runs — but the data-loss bug comes
+ * back until those two env vars are set. See README.md for setup.
  *
  * Setup:
  *   1. npm install
- *   2. copy .env.example to .env and fill in JWT_SECRET and ADMIN_EMAIL
- *   3. npm start
+ *   2. copy .env.example to .env and fill in JWT_SECRET, ADMIN_EMAIL,
+ *      SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY
+ *   3. In the Supabase SQL editor, run once:
+ *        create table app_state (id int primary key, data jsonb not null default '{}'::jsonb);
+ *   4. npm start
  *
  * See README.md for how to deploy this somewhere with a public URL.
  */
@@ -24,6 +31,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const fs = require('fs');
 const path = require('path');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(cors());
@@ -33,33 +41,91 @@ const JWT_SECRET = process.env.JWT_SECRET || 'change-this-before-you-deploy';
 const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '').toLowerCase().trim();
 const LEGISCAN_API_KEY = process.env.LEGISCAN_API_KEY || '';
 const COURTLISTENER_API_TOKEN = process.env.COURTLISTENER_API_TOKEN || '';
-const DB_FILE = path.join(__dirname, 'data.json');
+const DB_FILE = path.join(__dirname, 'data.json'); // fallback only — see storage note above
+const SUPABASE_URL = process.env.SUPABASE_URL || '';
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const supabase = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
+  ? createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, { auth: { persistSession: false } })
+  : null;
 
 if(JWT_SECRET === 'change-this-before-you-deploy'){
   console.warn('WARNING: JWT_SECRET is not set — set it in your environment before going live.');
 }
+if(!supabase){
+  console.warn('WARNING: SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not set — using the local data.json file for now. On Render (and most hosts) that file is wiped on every restart/redeploy, which loses every signup made since the last one. Set those two env vars to fix this for good.');
+}
 
-function loadDB(){
-  let db;
-  const blank = { users: [], streaks: {}, stories: [], questions: [], adInquiries: [], visits: { total: 0, uniqueIds: [] } };
-  if(!fs.existsSync(DB_FILE)) db = blank;
-  else{
-    try{ db = JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
-    catch(e){ db = blank; }
-  }
-  if(!Array.isArray(db.stories)) db.stories = []; // back-compat with data.json files saved before this feature existed
-  if(!Array.isArray(db.questions)) db.questions = []; // back-compat with data.json files saved before this feature existed
-  if(!Array.isArray(db.adInquiries)) db.adInquiries = []; // back-compat with data.json files saved before this feature existed
+function blankDB(){
+  return { users: [], streaks: {}, stories: [], questions: [], adInquiries: [], feedback: [], photos: [], stateViews: {}, tabViews: {}, visits: { total: 0, uniqueIds: [] } };
+}
+
+function applyBackCompat(db){
+  if(!db || typeof db !== 'object') db = blankDB();
+  if(!Array.isArray(db.users)) db.users = [];
+  if(!db.streaks || typeof db.streaks !== 'object') db.streaks = {};
+  if(!Array.isArray(db.stories)) db.stories = []; // back-compat with data saved before this feature existed
+  if(!Array.isArray(db.questions)) db.questions = []; // back-compat with data saved before this feature existed
+  if(!Array.isArray(db.adInquiries)) db.adInquiries = []; // back-compat with data saved before this feature existed
+  if(!Array.isArray(db.feedback)) db.feedback = []; // back-compat with data saved before this feature existed
+  if(!Array.isArray(db.photos)) db.photos = []; // back-compat with data saved before this feature existed
+  if(!db.stateViews || typeof db.stateViews !== 'object') db.stateViews = {}; // back-compat
+  if(!db.tabViews || typeof db.tabViews !== 'object') db.tabViews = {}; // back-compat
   if(!db.visits || typeof db.visits !== 'object') db.visits = { total: 0, uniqueIds: [] }; // back-compat
   if(!Array.isArray(db.visits.uniqueIds)) db.visits.uniqueIds = [];
   if(typeof db.visits.total !== 'number') db.visits.total = 0;
-  if(Array.isArray(db.users)){
-    db.users.forEach(u => { // back-compat with accounts created before membership existed
-      if(typeof u.isMember !== 'boolean') u.isMember = false;
-      if(typeof u.showOnWall !== 'boolean') u.showOnWall = false;
-    });
-  }
+  db.users.forEach(u => { // back-compat with accounts created before membership existed
+    if(typeof u.isMember !== 'boolean') u.isMember = false;
+    if(typeof u.showOnWall !== 'boolean') u.showOnWall = false;
+  });
   return db;
+}
+
+function loadLocalFile(){
+  if(!fs.existsSync(DB_FILE)) return blankDB();
+  try{ return JSON.parse(fs.readFileSync(DB_FILE, 'utf8')); }
+  catch(e){ return blankDB(); }
+}
+
+// The whole app's data, kept in memory once loaded and mirrored to Supabase (or the local
+// file, if Supabase isn't configured) on every save. loadDB()/saveDB() below are what every
+// route in this file actually calls — same names and shapes as before, so nothing past this
+// point needed to change for the move to real persistent storage.
+let cachedDB = null;
+
+async function initStorage(){
+  if(supabase){
+    try{
+      const { data, error } = await supabase.from('app_state').select('data').eq('id', 1).maybeSingle();
+      if(error) throw error;
+      if(data && data.data){
+        cachedDB = applyBackCompat(data.data);
+      } else {
+        cachedDB = blankDB();
+        const { error: insertErr } = await supabase.from('app_state').upsert({ id: 1, data: cachedDB });
+        if(insertErr) console.error('Could not create the initial Supabase row (does the app_state table exist?):', insertErr.message);
+      }
+      return;
+    }catch(e){
+      console.error('Could not reach Supabase on startup — using the local file for this run instead:', e.message);
+    }
+  }
+  cachedDB = applyBackCompat(loadLocalFile());
+}
+
+function loadDB(){
+  return cachedDB;
+}
+
+function saveDB(db){
+  cachedDB = db;
+  if(supabase){
+    supabase.from('app_state').update({ data: db }).eq('id', 1).then(({ error }) => {
+      if(error) console.error('Failed to save to Supabase:', error.message);
+    });
+  } else {
+    try{ fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2)); }
+    catch(e){ console.error('Failed to save data.json:', e.message); }
+  }
 }
 
 // Who's on the app right now — kept in memory only, never written to disk. It resets
@@ -81,7 +147,11 @@ function saveDB(db){
 }
 
 function publicUser(u){
-  return { id: u.id, email: u.email, displayName: u.displayName, isAdmin: !!u.isAdmin, isMember: !!u.isMember, showOnWall: !!u.showOnWall, createdAt: u.createdAt };
+  return {
+    id: u.id, email: u.email, displayName: u.displayName, isAdmin: !!u.isAdmin, isMember: !!u.isMember,
+    showOnWall: !!u.showOnWall, createdAt: u.createdAt,
+    bio: u.bio || '', homeState: u.homeState || '', showProfile: !!u.showProfile,
+  };
 }
 
 function authMiddleware(req, res, next){
@@ -137,6 +207,9 @@ app.post('/api/register', (req, res) => {
     isAdmin,
     isMember: false, // members are granted manually by the admin in the Dashboard tab (no Patreon API hookup)
     showOnWall: false, // opt-in: show this name on the public Supporters Wall
+    bio: '', // optional member profile — freeform, self-set, capped at 160 chars
+    homeState: '', // optional member profile — 2-letter state abbreviation, self-set
+    showProfile: false, // opt-in: show bio/homeState on the public member directory
     createdAt: new Date().toISOString(),
   };
   db.users.push(user);
@@ -257,6 +330,45 @@ app.get('/api/supporters', (req, res) => {
     .slice(0, 300)
     .map(u => ({ displayName: u.displayName, since: u.createdAt }));
   res.json({ supporters });
+});
+
+// Self-service: ANY signed-in user (not just paid members) can set an optional bio +
+// home state and opt in/out of the public member directory below. Separate from the
+// paid-member Supporters Wall above — this is free, for anyone with an account.
+const VALID_STATE_ABBRS = new Set([
+  'AL','AK','AZ','AR','CA','CO','CT','DE','DC','FL','GA','HI','ID','IL','IN','IA','KS','KY','LA',
+  'ME','MD','MA','MI','MN','MS','MO','MT','NE','NV','NH','NJ','NM','NY','NC','ND','OH','OK','OR',
+  'PA','RI','SC','SD','TN','TX','UT','VT','VA','WA','WV','WI','WY',
+]);
+app.post('/api/me/profile', authMiddleware, (req, res) => {
+  const { bio, homeState, showProfile } = req.body || {};
+  const db = loadDB();
+  const user = db.users.find(u => u.id === req.user.id);
+  if(!user) return res.status(404).json({ error: 'User not found.' });
+
+  const cleanBio = String(bio || '').trim().slice(0, 160);
+  const cleanState = String(homeState || '').trim().toUpperCase();
+  if(cleanState && !VALID_STATE_ABBRS.has(cleanState)){
+    return res.status(400).json({ error: 'That doesn\'t look like a valid state.' });
+  }
+
+  user.bio = cleanBio;
+  user.homeState = cleanState;
+  user.showProfile = !!showProfile;
+  saveDB(db);
+  res.json({ user: publicUser(user) });
+});
+
+// Public: opted-in member profiles — display name, home state, and bio only. No emails,
+// no streaks, no membership status. Oldest account first, same ordering as the wall.
+app.get('/api/members', (req, res) => {
+  const db = loadDB();
+  const members = db.users
+    .filter(u => u.showProfile && (u.bio || u.homeState))
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+    .slice(0, 300)
+    .map(u => ({ displayName: u.displayName, homeState: u.homeState || '', bio: u.bio || '', since: u.createdAt }));
+  res.json({ members });
 });
 
 /* ---------------- Pulled-over stories (community, admin-moderated) ---------------- */
@@ -462,6 +574,112 @@ app.post('/api/admin/ad-inquiries/:id/status', authMiddleware, adminMiddleware, 
   res.json({ inquiry: entry });
 });
 
+/* ---------------- App feedback (admin-moderated inbox) ---------------- */
+// General "tell us what you think" feedback — bugs, feature requests, praise, whatever.
+// Anyone can submit, no account needed. Nothing here is ever shown publicly; it's an
+// admin-only inbox, same shape as the ad-inquiries one above.
+app.post('/api/feedback', (req, res) => {
+  const { category, message, contactEmail, website } = req.body || {};
+  if(website) return res.json({ ok: true }); // honeypot field — bots fill it, real users never see it
+
+  const validCategories = ['bug', 'feature idea', 'praise', 'other'];
+  const cat = validCategories.includes(category) ? category : 'other';
+  const messageText = String(message || '').trim();
+  if(messageText.length < 5 || messageText.length > 1000){
+    return res.status(400).json({ error: 'Tell us what\'s on your mind in 5–1000 characters.' });
+  }
+  const email = String(contactEmail || '').trim().slice(0, 200);
+
+  const db = loadDB();
+  db.feedback.push({
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+    category: cat,
+    message: messageText,
+    contactEmail: email || null,
+    status: 'new',
+    createdAt: new Date().toISOString(),
+  });
+  if(db.feedback.length > 2000) db.feedback = db.feedback.slice(-2000);
+  saveDB(db);
+  res.json({ ok: true });
+});
+
+app.get('/api/admin/feedback', authMiddleware, adminMiddleware, (req, res) => {
+  const db = loadDB();
+  res.json({ feedback: db.feedback.slice().reverse() });
+});
+
+app.post('/api/admin/feedback/:id/status', authMiddleware, adminMiddleware, (req, res) => {
+  const { status } = req.body || {};
+  if(!['new', 'read', 'resolved'].includes(status)){
+    return res.status(400).json({ error: 'status must be new, read, or resolved.' });
+  }
+  const db = loadDB();
+  const entry = db.feedback.find(f => f.id === req.params.id);
+  if(!entry) return res.status(404).json({ error: 'Feedback not found.' });
+  entry.status = status;
+  saveDB(db);
+  res.json({ feedback: entry });
+});
+
+/* ---------------- Community photos (link-based, admin-moderated) ---------------- */
+// Same "paste a link to something already hosted" pattern as the pulled-over stories'
+// video link — no file upload, no hosting account needed on our end. Admin-approved
+// before anything shows up on the public Community tab.
+app.post('/api/photos', (req, res) => {
+  const { photoLink, caption, state, displayName, website } = req.body || {};
+  if(website) return res.json({ ok: true }); // honeypot field
+
+  const link = String(photoLink || '').trim().slice(0, 500);
+  if(!link || !isHttpUrl(link)){
+    return res.status(400).json({ error: 'Paste a real link (starting with http:// or https://) to a photo you\'ve already uploaded somewhere.' });
+  }
+  const captionText = String(caption || '').trim().slice(0, 200);
+  const stateAbbr = /^[A-Za-z]{2}$/.test(String(state || '')) ? String(state).toUpperCase() : null;
+  const name = String(displayName || '').trim().slice(0, 40) || 'Anonymous';
+
+  const db = loadDB();
+  db.photos.push({
+    id: Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+    photoLink: link,
+    caption: captionText,
+    state: stateAbbr,
+    displayName: name,
+    status: 'pending',
+    createdAt: new Date().toISOString(),
+  });
+  if(db.photos.length > 2000) db.photos = db.photos.slice(-2000);
+  saveDB(db);
+  res.json({ ok: true });
+});
+
+app.get('/api/photos', (req, res) => {
+  const db = loadDB();
+  const approved = db.photos
+    .filter(p => p.status === 'approved')
+    .slice().reverse().slice(0, 200)
+    .map(p => ({ id: p.id, photoLink: p.photoLink, caption: p.caption, state: p.state, displayName: p.displayName, createdAt: p.createdAt }));
+  res.json({ photos: approved });
+});
+
+app.get('/api/admin/photos', authMiddleware, adminMiddleware, (req, res) => {
+  const db = loadDB();
+  res.json({ photos: db.photos.slice().reverse() });
+});
+
+app.post('/api/admin/photos/:id/status', authMiddleware, adminMiddleware, (req, res) => {
+  const { status } = req.body || {};
+  if(!['pending', 'approved', 'rejected'].includes(status)){
+    return res.status(400).json({ error: 'status must be pending, approved, or rejected.' });
+  }
+  const db = loadDB();
+  const entry = db.photos.find(p => p.id === req.params.id);
+  if(!entry) return res.status(404).json({ error: 'Photo not found.' });
+  entry.status = status;
+  saveDB(db);
+  res.json({ photo: entry });
+});
+
 /* ---------------- Traffic: visits, live count, admin dashboard ---------------- */
 // visitorId is a random ID the app generates once per device and stores locally
 // (not personal info, just a way to tell "one more open" from "one more person").
@@ -486,8 +704,51 @@ app.post('/api/heartbeat', (req, res) => {
   res.json({ ok: true }); // no disk write here on purpose — this fires every ~20s per open tab
 });
 
+// Fire-and-forget: the app calls this whenever someone opens a state's page. No auth,
+// no personal data — just "this state got looked at one more time," so Antonio can see
+// which states actually get used. Silently ignores anything that isn't a real 2-letter code.
+app.post('/api/state-view', (req, res) => {
+  const abbr = String((req.body || {}).abbr || '').toUpperCase();
+  if(/^[A-Z]{2}$/.test(abbr)){
+    const db = loadDB();
+    db.stateViews[abbr] = (db.stateViews[abbr] || 0) + 1;
+    saveDB(db);
+  }
+  res.json({ ok: true });
+});
+
+// Fire-and-forget: which tab someone opened, so Antonio can see what actually gets used
+// versus what's just sitting there. No auth, no personal data.
+app.post('/api/tab-view', (req, res) => {
+  const tab = String((req.body || {}).tab || '').toLowerCase().replace(/[^a-z0-9_-]/g, '').slice(0, 40);
+  if(tab){
+    const db = loadDB();
+    db.tabViews[tab] = (db.tabViews[tab] || 0) + 1;
+    saveDB(db);
+  }
+  res.json({ ok: true });
+});
+
 app.get('/api/admin/stats', authMiddleware, adminMiddleware, (req, res) => {
   const db = loadDB();
+  const topStates = Object.entries(db.stateViews)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([abbr, count]) => ({ abbr, count }));
+  const topTabs = Object.entries(db.tabViews)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 10)
+    .map(([tab, count]) => ({ tab, count }));
+  const quizTotals = Object.values(db.streaks).reduce((acc, s) => {
+    acc.answered += s.totalAnswered || 0;
+    acc.correct += s.totalCorrect || 0;
+    return acc;
+  }, { answered: 0, correct: 0 });
+  const now = Date.now();
+  const DAY = 24 * 60 * 60 * 1000;
+  const signupsLast7Days = db.users.filter(u => now - new Date(u.createdAt).getTime() < 7 * DAY).length;
+  const signupsLast30Days = db.users.filter(u => now - new Date(u.createdAt).getTime() < 30 * DAY).length;
+
   res.json({
     totalUsers: db.users.length,
     totalVisits: db.visits.total,
@@ -496,6 +757,15 @@ app.get('/api/admin/stats', authMiddleware, adminMiddleware, (req, res) => {
     pendingStories: db.stories.filter(s => s.status === 'pending').length,
     pendingQuestions: db.questions.filter(q => q.status === 'pending').length,
     pendingAdInquiries: db.adInquiries.filter(a => a.status === 'pending').length,
+    newFeedback: db.feedback.filter(f => f.status === 'new').length,
+    pendingPhotos: db.photos.filter(p => p.status === 'pending').length,
+    memberCount: db.users.filter(u => u.isMember).length,
+    signupsLast7Days,
+    signupsLast30Days,
+    quizAnswersTotal: quizTotals.answered,
+    quizCorrectTotal: quizTotals.correct,
+    topStates,
+    topTabs,
   });
 });
 
@@ -597,4 +867,12 @@ app.get('/api/case-law', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Edison backend running on port ' + PORT));
+initStorage().then(() => {
+  app.listen(PORT, () => console.log(
+    'Edison backend running on port ' + PORT +
+    (supabase ? ' — storage: Supabase (persists across restarts)' : ' — storage: local file (WILL lose data on restart/redeploy — set SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY to fix)')
+  ));
+}).catch(err => {
+  console.error('Failed to initialize storage on startup — refusing to start with no data loaded:', err);
+  process.exit(1);
+});
