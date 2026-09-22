@@ -89,7 +89,7 @@ if(!supabase){
 }
 
 function blankDB(){
-  return { users: [], streaks: {}, stories: [], questions: [], adInquiries: [], feedback: [], photos: [], stateViews: {}, tabViews: {}, visits: { total: 0, uniqueIds: [] }, gameScores: {} };
+  return { users: [], streaks: {}, stories: [], questions: [], adInquiries: [], feedback: [], photos: [], stateViews: {}, tabViews: {}, visits: { total: 0, uniqueIds: [] }, gameScores: {}, dailyStats: {} };
 }
 
 function applyBackCompat(db){
@@ -107,11 +107,31 @@ function applyBackCompat(db){
   if(!db.visits || typeof db.visits !== 'object') db.visits = { total: 0, uniqueIds: [] }; // back-compat
   if(!Array.isArray(db.visits.uniqueIds)) db.visits.uniqueIds = [];
   if(typeof db.visits.total !== 'number') db.visits.total = 0;
+  if(!db.dailyStats || typeof db.dailyStats !== 'object') db.dailyStats = {}; // back-compat — added 2026-09-21 for the admin Dashboard graphs; { 'YYYY-MM-DD': { visits, quizAnswers, quizCorrect } }, days before this change simply have no entry (charts show 0, not an error)
   db.users.forEach(u => { // back-compat with accounts created before membership existed
     if(typeof u.isMember !== 'boolean') u.isMember = false;
     if(typeof u.showOnWall !== 'boolean') u.showOnWall = false;
   });
   return db;
+}
+
+// ---- Daily stats bucket, powers the admin Dashboard graphs (added 2026-09-21) ----
+// Keyed by UTC calendar day ('YYYY-MM-DD') since the server has no reliable notion of
+// "Antonio's local day." Only a few counters get bumped live (visits, quiz activity) —
+// signups-per-day is derived straight from each user's existing createdAt instead of
+// double-tracked here, so there's only one place that can drift.
+function todayKey(){
+  return new Date().toISOString().slice(0, 10);
+}
+function bumpDaily(db, field, amount){
+  const key = todayKey();
+  if(!db.dailyStats[key]) db.dailyStats[key] = { visits: 0, quizAnswers: 0, quizCorrect: 0 };
+  db.dailyStats[key][field] = (db.dailyStats[key][field] || 0) + amount;
+  // Keep this from growing forever — 120 days is far more than the 30-day chart needs.
+  const keys = Object.keys(db.dailyStats);
+  if(keys.length > 120){
+    keys.sort().slice(0, keys.length - 120).forEach(k => delete db.dailyStats[k]);
+  }
 }
 
 function loadLocalFile(){
@@ -322,6 +342,8 @@ app.post('/api/streak', authMiddleware, (req, res) => {
   updated.longestStreak = Math.max(prev.longestStreak || 0, updated.streak);
 
   db.streaks[req.user.id] = updated;
+  bumpDaily(db, 'quizAnswers', 1);
+  if(correct) bumpDaily(db, 'quizCorrect', 1);
   saveDB(db);
   res.json({ progress: updated });
 });
@@ -352,6 +374,8 @@ app.post('/api/games/state-trivia/round', authMiddleware, (req, res) => {
   entry.totalScore += correctNum; // simple, transparent scoring: 1 point per correct answer, same unit every game on this leaderboard uses
   entry.lastPlayedAt = new Date().toISOString();
   db.gameScores[req.user.id] = entry;
+  bumpDaily(db, 'quizAnswers', totalNum);
+  bumpDaily(db, 'quizCorrect', correctNum);
   saveDB(db);
   res.json({ score: entry, roundsRemaining: Math.max(0, 3 - entry.roundsPlayedSinceLogin) });
 });
@@ -795,6 +819,7 @@ app.post('/api/visit', (req, res) => {
     db.visits.uniqueIds.push(id);
     if(db.visits.uniqueIds.length > 100000) db.visits.uniqueIds = db.visits.uniqueIds.slice(-100000);
   }
+  bumpDaily(db, 'visits', 1);
   saveDB(db);
   if(id) liveVisitors.set(id, Date.now());
   res.json({ ok: true });
@@ -852,6 +877,24 @@ app.get('/api/admin/stats', authMiddleware, adminMiddleware, (req, res) => {
   const signupsLast7Days = db.users.filter(u => now - new Date(u.createdAt).getTime() < 7 * DAY).length;
   const signupsLast30Days = db.users.filter(u => now - new Date(u.createdAt).getTime() < 30 * DAY).length;
 
+  // Day-by-day series for the admin Dashboard graphs (added 2026-09-21), oldest first, today last.
+  // Signups are derived fresh from each user's createdAt every time (works retroactively, can't drift);
+  // visits/quiz activity come from the dailyStats bucket bumpDaily() has been filling in since this
+  // shipped — days before that simply read as 0, not an error.
+  const dailySeries = [];
+  for(let i = 29; i >= 0; i--){
+    const dateKey = new Date(now - i * DAY).toISOString().slice(0, 10);
+    const daySignups = db.users.filter(u => String(u.createdAt || '').slice(0, 10) === dateKey).length;
+    const bucket = db.dailyStats[dateKey] || {};
+    dailySeries.push({
+      date: dateKey,
+      signups: daySignups,
+      visits: bucket.visits || 0,
+      quizAnswers: bucket.quizAnswers || 0,
+      quizCorrect: bucket.quizCorrect || 0,
+    });
+  }
+
   res.json({
     totalUsers: db.users.length,
     totalVisits: db.visits.total,
@@ -869,6 +912,7 @@ app.get('/api/admin/stats', authMiddleware, adminMiddleware, (req, res) => {
     quizCorrectTotal: quizTotals.correct,
     topStates,
     topTabs,
+    dailySeries,
   });
 });
 
